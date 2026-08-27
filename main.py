@@ -1,287 +1,452 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import re
-import unicodedata
 
 
 app = FastAPI()
 
 
-# ---------------------------------------------------------
-# Constants / validators
-# ---------------------------------------------------------
+# ============================================================
+# Constants
+# ============================================================
 
-URI_RE = re.compile(r"^gs://[^/]+/[^/]+$")
-GEN_RE = re.compile(r"^[0-9]+$")
-CRC_RE = re.compile(r"^[0-9a-f]{8}$")
+REQUIRED_FILES = [
+    "README.md",
+    "training_manifest.json",
+    "evaluation.json",
+    "inventory.json",
+    "adapter_model.safetensors",
+    "adapter_config.json",
+]
 
-# YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm)
-TS_RE = re.compile(
-    r"^"
-    r"\d{4}-\d{2}-\d{2}"
-    r"T"
-    r"\d{2}:\d{2}:\d{2}"
-    r"(?:\.\d{1,3})?"
-    r"(?:Z|[+-]\d{2}:\d{2})"
-    r"$"
-)
+UNSAFE_EXTENSIONS = {
+    ".bin",
+    ".pt",
+    ".pth",
+    ".pkl",
+    ".pickle",
+}
 
-SAFE_INT_MAX = (1 << 53) - 1
-
-
-# ---------------------------------------------------------
-# CRC32C / Castagnoli
-# ---------------------------------------------------------
-
-CRC32C_POLY = 0x82F63B78
+SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def crc32c(data: bytes) -> int:
-    crc = 0xFFFFFFFF
+# ============================================================
+# Helpers
+# ============================================================
 
-    for byte in data:
-        crc ^= byte
-
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ CRC32C_POLY
-            else:
-                crc >>= 1
-
-    return crc ^ 0xFFFFFFFF
+def utf8_bytes(value):
+    return value.encode("utf-8")
 
 
-def crc32c_hex(text: str) -> str:
-    return f"{crc32c(text.encode('utf-8')):08x}"
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
 
 
-# ---------------------------------------------------------
-# Timestamp handling
-# ---------------------------------------------------------
+def compact_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
-def parse_ts(ts):
-    if not isinstance(ts, str):
-        return None
 
-    if not TS_RE.fullmatch(ts):
-        return None
+def utf8_sort_key(value):
+    return value.encode("utf-8")
+
+
+def safe_positive_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value <= (2**53 - 1)
+    )
+
+
+def finite_unit_interval(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+
+
+def is_valid_sha256(value):
+    return (
+        isinstance(value, str)
+        and SHA256_RE.fullmatch(value) is not None
+    )
+
+
+# ============================================================
+# Policy validation
+# ============================================================
+
+def validate_policy(policy):
+    violations = []
+
+    if not isinstance(policy, dict):
+        return ["INVALID_POLICY"]
+
+    required_slices = policy.get("requiredSlices")
+
+    if (
+        not isinstance(required_slices, list)
+        or len(required_slices) == 0
+        or any(
+            not isinstance(x, str) or x == ""
+            for x in required_slices
+        )
+        or len(set(required_slices)) != len(required_slices)
+    ):
+        violations.append("INVALID_POLICY")
+
+    for field in ("license", "intendedUse", "limitations"):
+        value = policy.get(field)
+
+        if not isinstance(value, str) or value == "":
+            violations.append("INVALID_POLICY")
+
+    return violations
+
+
+# ============================================================
+# JSON parsing
+# ============================================================
+
+def parse_json_file(files, name):
+    violations = []
+
+    if name not in files:
+        return None, violations
+
+    value = files[name]
+
+    if not isinstance(value, str):
+        violations.append(f"INVALID_FILE:{name}")
+        return None, violations
 
     try:
-        # Validate the offset magnitude strictly.
-        if ts.endswith("Z"):
-            value = ts[:-1] + "+00:00"
-        else:
-            offset = ts[-6:]
-            sign = offset[0]
-            hours = int(offset[1:3])
-            minutes = int(offset[4:6])
-
-            if minutes > 59:
-                return None
-
-            if hours > 14:
-                return None
-
-            if hours == 14 and minutes != 0:
-                return None
-
-            value = ts
-
-        dt = datetime.fromisoformat(value)
-
-        if dt.tzinfo is None:
-            return None
-
-        return dt
-
-    except (ValueError, TypeError, OverflowError):
-        return None
+        parsed = json.loads(value)
+        return parsed, violations
+    except (json.JSONDecodeError, TypeError):
+        violations.append(f"INVALID_JSON:{name}")
+        return None, violations
 
 
-def norm_ts(ts):
-    dt = parse_ts(ts)
+# ============================================================
+# Inventory
+# ============================================================
 
-    if dt is None:
-        return None
+def compute_inventory(files):
+    entries = []
 
-    dt = dt.astimezone(timezone.utc)
+    for name, content in files.items():
 
-    return (
-        dt.strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{dt.microsecond // 1000:03d}"
-        + "Z"
+        if name == "inventory.json":
+            continue
+
+        if not isinstance(name, str):
+            continue
+
+        if not isinstance(content, str):
+            continue
+
+        raw = content.encode("utf-8")
+
+        entries.append(
+            {
+                "name": name,
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+
+    entries.sort(
+        key=lambda x: x["name"].encode("utf-8")
     )
 
-
-# ---------------------------------------------------------
-# Canonicalization
-# ---------------------------------------------------------
-
-def canon(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value)
-    value = value.lower()
-    value = value.strip()
-
-    # Collapse Unicode whitespace to ASCII space.
-    chars = []
-    in_space = False
-
-    for ch in value:
-        if ch.isspace():
-            if not in_space:
-                chars.append(" ")
-            in_space = True
-        else:
-            chars.append(ch)
-            in_space = False
-
-    return "".join(chars)
+    return entries
 
 
-# ---------------------------------------------------------
-# JSON serialization
-# ---------------------------------------------------------
+def verify_inventory(files, supplied_inventory):
+    violations = []
 
-def compact(row):
-    return json.dumps(
-        {
-            "id": row["id"],
-            "entity": row["entity"],
-            "eventTime": row["eventTime"],
-            "revision": row["revision"],
-            "text": row["text"],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
+    expected = compute_inventory(files)
+
+    if not isinstance(supplied_inventory, list):
+        return ["INVENTORY_MISMATCH"]
+
+    # Exact compact JSON comparison is important.
+    expected_bytes = compact_json(expected).encode("utf-8")
+    supplied_bytes = compact_json(supplied_inventory).encode("utf-8")
+
+    if expected_bytes != supplied_bytes:
+        violations.append("INVENTORY_MISMATCH")
+
+    return violations
+
+
+# ============================================================
+# Adapter config
+# ============================================================
+
+def validate_adapter_config(config):
+    if not isinstance(config, dict):
+        return ["INVALID_ADAPTER_CONFIG"]
+
+    r = config.get("r")
+
+    if not safe_positive_integer(r):
+        return ["INVALID_ADAPTER_CONFIG"]
+
+    target_modules = config.get("target_modules")
+
+    if (
+        not isinstance(target_modules, list)
+        or len(target_modules) == 0
+        or any(
+            not isinstance(x, str) or x == ""
+            for x in target_modules
+        )
+        or len(set(target_modules)) != len(target_modules)
+    ):
+        return ["INVALID_ADAPTER_CONFIG"]
+
+    return []
+
+
+# ============================================================
+# Training manifest
+# ============================================================
+
+MANIFEST_REQUIRED_FIELDS = [
+    "baseRevision",
+    "task",
+    "datasetDigest",
+    "codeDigest",
+    "trainingConfigDigest",
+    "modelArtifactDigest",
+    "evaluationArtifactDigest",
+]
+
+
+def validate_training_manifest(manifest):
+    violations = []
+
+    if not isinstance(manifest, dict):
+        return ["INVALID_TRAINING_MANIFEST"]
+
+    base_revision = manifest.get("baseRevision")
+
+    if (
+        not isinstance(base_revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_revision) is None
+    ):
+        violations.append("MUTABLE_BASE_REVISION")
+
+    for field in MANIFEST_REQUIRED_FIELDS[1:]:
+        value = manifest.get(field)
+
+        if not isinstance(value, str) or value == "":
+            violations.append(
+                f"MISSING_MANIFEST_FIELD:{field}"
+            )
+
+    return violations
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+def validate_evaluation(
+    evaluation,
+    model_digest,
+    required_slices,
+):
+    violations = []
+
+    if not isinstance(evaluation, dict):
+        return ["INVALID_EVALUATION"]
+
+    # The evaluation must bind the model artifact digest.
+    evaluation_model_digest = evaluation.get(
+        "modelArtifactDigest"
     )
 
+    if evaluation_model_digest != model_digest:
+        violations.append(
+            "MODEL_ARTIFACT_MISMATCH"
+        )
 
-def row_sort_key(row):
-    return (
-        row["id"].encode("utf-8"),
-        compact(row).encode("utf-8"),
-    )
+    # Aggregate
+    aggregate = evaluation.get("aggregate")
+
+    if aggregate is None:
+        violations.append("INVALID_AGGREGATE")
+    elif not finite_unit_interval(aggregate):
+        violations.append("INVALID_AGGREGATE")
+
+    # Required slices
+    slices = evaluation.get("slices")
+
+    if not isinstance(slices, dict):
+        for slice_name in required_slices:
+            violations.append(
+                f"MISSING_SLICE:{slice_name}"
+            )
+    else:
+        for slice_name in required_slices:
+
+            if slice_name not in slices:
+                violations.append(
+                    f"MISSING_SLICE:{slice_name}"
+                )
+                continue
+
+            value = slices[slice_name]
+
+            if not finite_unit_interval(value):
+                violations.append(
+                    f"SLICE_RANGE:{slice_name}"
+                )
+
+    return violations
 
 
-def digest(rows):
-    rows = sorted(rows, key=row_sort_key)
+# ============================================================
+# Model card
+# ============================================================
 
-    data = "".join(
-        compact(row) + "\n"
-        for row in rows
-    ).encode("utf-8")
-
-    return hashlib.sha256(data).hexdigest(), rows
+MODEL_CARD_PREFIX = "<!-- tds-model-card "
+MODEL_CARD_SUFFIX = "-->"
 
 
-# ---------------------------------------------------------
-# Unicode letter/number word-set
-# ---------------------------------------------------------
-
-def words(text):
+def find_model_cards(readme):
     """
-    Extract maximal sequences consisting only of Unicode
-    letters or Unicode numbers.
+    Find exact model-card markers.
 
-    Underscore is NOT considered a word character.
+    Braces inside JSON strings do not affect parsing because
+    we locate the closing '-->' delimiter rather than trying
+    to parse braces manually.
     """
 
-    result = []
-    current = []
+    cards = []
+    position = 0
 
-    for ch in text.lower():
-        category = unicodedata.category(ch)
+    while True:
 
-        if category.startswith("L") or category.startswith("N"):
-            current.append(ch)
-        else:
-            if current:
-                result.append("".join(current))
-                current = []
+        start = readme.find(
+            MODEL_CARD_PREFIX,
+            position,
+        )
 
-    if current:
-        result.append("".join(current))
+        if start == -1:
+            break
 
-    return set(result)
+        payload_start = start + len(
+            MODEL_CARD_PREFIX
+        )
 
+        end = readme.find(
+            MODEL_CARD_SUFFIX,
+            payload_start,
+        )
 
-def jaccard(a, b):
-    if not a and not b:
-        return 1.0
+        if end == -1:
+            # Marker exists but has no closing delimiter.
+            cards.append(None)
+            break
 
-    union = a | b
+        payload = readme[
+            payload_start:end
+        ].strip()
 
-    if not union:
-        return 1.0
+        try:
+            parsed = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
 
-    return len(a & b) / len(union)
+        cards.append(parsed)
 
+        position = end + len(
+            MODEL_CARD_SUFFIX
+        )
 
-# ---------------------------------------------------------
-# Deterministic sorting helpers
-# ---------------------------------------------------------
-
-def compact_obj(obj):
-    return json.dumps(
-        obj,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def reason_codes(codes):
-    return sorted(
-        set(codes),
-        key=lambda x: x.encode("utf-8"),
-    )
+    return cards
 
 
-def sort_rejected_objects(items):
-    return sorted(
-        items,
-        key=lambda x: (
-            (x["uri"] if isinstance(x["uri"], str) else "").encode("utf-8"),
-            compact_obj(x).encode("utf-8"),
+def validate_model_card(
+    readme,
+    manifest,
+    evaluation,
+    policy,
+):
+    violations = []
+
+    if not isinstance(readme, str):
+        return [
+            "MODEL_CARD_COUNT",
+            "MISSING_MODEL_CARD",
+        ]
+
+    cards = find_model_cards(readme)
+
+    if len(cards) == 0:
+        return ["MISSING_MODEL_CARD"]
+
+    if len(cards) > 1:
+        return ["MODEL_CARD_COUNT"]
+
+    card = cards[0]
+
+    if not isinstance(card, dict):
+        return ["INVALID_MODEL_CARD"]
+
+    expected = {
+        "task": manifest.get("task"),
+        "baseRevision": manifest.get("baseRevision"),
+        "datasetDigest": manifest.get("datasetDigest"),
+        "modelArtifactDigest": manifest.get(
+            "modelArtifactDigest"
         ),
-    )
+        "license": policy.get("license"),
+        "intendedUse": policy.get("intendedUse"),
+        "limitations": policy.get("limitations"),
+    }
+
+    for field, expected_value in expected.items():
+
+        if card.get(field) != expected_value:
+            violations.append(
+                "MODEL_CARD_MISMATCH"
+            )
+            break
+
+    return violations
 
 
-def sort_rejected_rows(items):
-    return sorted(
-        items,
-        key=lambda x: (
-            x["id"].encode("utf-8"),
-            compact_obj(x).encode("utf-8"),
-        ),
-    )
-
-
-def sort_lineage(items):
-    return sorted(
-        items,
-        key=lambda x: (
-            x["uri"].encode("utf-8"),
-            compact_obj(x).encode("utf-8"),
-        ),
-    )
-
-
-# ---------------------------------------------------------
+# ============================================================
 # Main endpoint
-# ---------------------------------------------------------
+# ============================================================
 
-@app.post("/build-corpus")
-async def build_corpus(body: dict):
+@app.post("/verify-bundle")
+async def verify_bundle(body: dict):
 
-    # Exact invalid-input condition.
+    # --------------------------------------------------------
+    # Top-level input validation
+    # --------------------------------------------------------
+
     if (
         not isinstance(body, dict)
+        or "policy" not in body
+        or "files" not in body
         or not isinstance(body.get("policy"), dict)
-        or not isinstance(body.get("objects"), list)
+        or not isinstance(body.get("files"), dict)
     ):
         return JSONResponse(
             status_code=400,
@@ -289,423 +454,338 @@ async def build_corpus(body: dict):
         )
 
     policy = body["policy"]
+    files = body["files"]
 
-    min_t = parse_ts(policy.get("minTime"))
-    max_t = parse_ts(policy.get("maxTime"))
+    violations = []
 
-    threshold = policy.get("contaminationThreshold")
+    # --------------------------------------------------------
+    # Policy
+    # --------------------------------------------------------
 
-    policy_valid = (
-        min_t is not None
-        and max_t is not None
-        and isinstance(threshold, (int, float))
-        and not isinstance(threshold, bool)
-        and math.isfinite(threshold)
-        and 0 <= threshold <= 1
+    violations.extend(
+        validate_policy(policy)
     )
 
-    retained = []
+    required_slices = policy.get(
+        "requiredSlices",
+        [],
+    )
 
-    rejected_objects = []
-    rejected_rows = []
-    lineage = []
+    # --------------------------------------------------------
+    # Required files
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # Validate objects
-    # -----------------------------------------------------
+    for name in REQUIRED_FILES:
+        if name not in files:
+            violations.append(
+                f"MISSING_FILE:{name}"
+            )
 
-    for obj in body["objects"]:
+    # --------------------------------------------------------
+    # File value validation
+    # --------------------------------------------------------
 
-        # A non-object in objects cannot satisfy the required
-        # object fields. Treat it as an invalid object.
-        if not isinstance(obj, dict):
-            rejected_objects.append(
-                {
-                    "uri": None,
-                    "reasonCodes": [
-                        "URI_INVALID",
-                        "GENERATION_INVALID",
-                        "CRC32C_INVALID",
-                        "SCHEMA_INVALID",
-                    ],
-                }
+    for name, value in files.items():
+
+        if not isinstance(name, str):
+            violations.append(
+                "UNTRACKED_FILE"
             )
             continue
 
-        codes = []
+        if not isinstance(value, str):
+            violations.append(
+                f"INVALID_FILE:{name}"
+            )
 
-        uri = obj.get("uri")
+    # --------------------------------------------------------
+    # Extra / untracked files
+    # --------------------------------------------------------
 
-        # URI
-        if not isinstance(uri, str) or not URI_RE.fullmatch(uri):
-            codes.append("URI_INVALID")
+    for name in files:
 
-        # Generations
-        generation = obj.get("generation")
-        fetched_generation = obj.get("fetchedGeneration")
+        if not isinstance(name, str):
+            continue
 
-        generation_valid = (
-            isinstance(generation, str)
-            and GEN_RE.fullmatch(generation) is not None
+        if name not in REQUIRED_FILES:
+            violations.append(
+                "UNTRACKED_FILE"
+            )
+
+    # --------------------------------------------------------
+    # Unsafe weights
+    # --------------------------------------------------------
+
+    for name in files:
+
+        if not isinstance(name, str):
+            continue
+
+        lower = name.lower()
+
+        for extension in UNSAFE_EXTENSIONS:
+
+            if lower.endswith(extension):
+                violations.append(
+                    "UNSAFE_WEIGHTS"
+                )
+                break
+
+    # --------------------------------------------------------
+    # inventory.json
+    # --------------------------------------------------------
+
+    inventory = None
+
+    if "inventory.json" in files:
+
+        inventory, inventory_errors = parse_json_file(
+            files,
+            "inventory.json",
         )
 
-        fetched_generation_valid = (
-            isinstance(fetched_generation, str)
-            and GEN_RE.fullmatch(fetched_generation) is not None
+        violations.extend(inventory_errors)
+
+        if inventory_errors == []:
+            violations.extend(
+                verify_inventory(
+                    files,
+                    inventory,
+                )
+            )
+
+    # --------------------------------------------------------
+    # Inventory digest
+    # --------------------------------------------------------
+
+    recomputed_inventory = compute_inventory(
+        files
+    )
+
+    inventory_digest = hashlib.sha256(
+        compact_json(
+            recomputed_inventory
+        ).encode("utf-8")
+    ).hexdigest()
+
+    # --------------------------------------------------------
+    # Adapter config
+    # --------------------------------------------------------
+
+    adapter_config = None
+
+    if "adapter_config.json" in files:
+
+        adapter_config, errors = parse_json_file(
+            files,
+            "adapter_config.json",
         )
 
-        if not generation_valid:
-            codes.append("GENERATION_INVALID")
+        violations.extend(errors)
 
-        if not fetched_generation_valid:
-            codes.append("GENERATION_INVALID")
+        if not errors:
+            violations.extend(
+                validate_adapter_config(
+                    adapter_config
+                )
+            )
+
+    # --------------------------------------------------------
+    # Training manifest
+    # --------------------------------------------------------
+
+    manifest = None
+
+    if "training_manifest.json" in files:
+
+        manifest, errors = parse_json_file(
+            files,
+            "training_manifest.json",
+        )
+
+        violations.extend(errors)
+
+        if not errors:
+            violations.extend(
+                validate_training_manifest(
+                    manifest
+                )
+            )
+
+    # --------------------------------------------------------
+    # Model artifact digest
+    # --------------------------------------------------------
+
+    model_digest = None
+
+    if (
+        "adapter_model.safetensors" in files
+        and isinstance(
+            files["adapter_model.safetensors"],
+            str,
+        )
+    ):
+        model_digest = hashlib.sha256(
+            files[
+                "adapter_model.safetensors"
+            ].encode("utf-8")
+        ).hexdigest()
+
+    # --------------------------------------------------------
+    # Evaluation artifact digest
+    # --------------------------------------------------------
+
+    evaluation_digest = None
+    evaluation = None
+
+    if "evaluation.json" in files:
+
+        if isinstance(files["evaluation.json"], str):
+
+            evaluation_bytes = files[
+                "evaluation.json"
+            ].encode("utf-8")
+
+            evaluation_digest = hashlib.sha256(
+                evaluation_bytes
+            ).hexdigest()
+
+        evaluation, errors = parse_json_file(
+            files,
+            "evaluation.json",
+        )
+
+        violations.extend(errors)
+
+    # --------------------------------------------------------
+    # Manifest digest binding
+    # --------------------------------------------------------
+
+    if isinstance(manifest, dict):
+
+        expected_model_digest = manifest.get(
+            "modelArtifactDigest"
+        )
+
+        expected_evaluation_digest = manifest.get(
+            "evaluationArtifactDigest"
+        )
 
         if (
-            generation_valid
-            and fetched_generation_valid
-            and generation != fetched_generation
+            model_digest is not None
+            and isinstance(
+                expected_model_digest,
+                str,
+            )
+            and expected_model_digest != model_digest
         ):
-            codes.append("GENERATION_MISMATCH")
-
-        # CRC
-        crc = obj.get("crc32c")
-
-        crc_valid = (
-            isinstance(crc, str)
-            and CRC_RE.fullmatch(crc) is not None
-        )
-
-        if not crc_valid:
-            codes.append("CRC32C_INVALID")
-
-        # Schema/content
-        content = obj.get("content")
-        schema_id = obj.get("schemaId")
-
-        if schema_id != "training-v1" or not isinstance(content, str):
-            codes.append("SCHEMA_INVALID")
-
-        # CRC mismatch is checked only when content is a string
-        # and CRC syntax is valid.
-        if isinstance(content, str) and crc_valid:
-            if crc32c_hex(content) != crc:
-                codes.append("CRC32C_MISMATCH")
-
-        rows = []
-
-        # Only parse JSONL when the object-level integrity fields
-        # are otherwise valid.
-        if not codes:
-
-            for line in content.splitlines():
-
-                # Blank lines are ignored.
-                if not line.strip():
-                    continue
-
-                try:
-                    parsed = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    codes.append("JSONL_INVALID")
-                    rows = []
-                    break
-
-                # JSON must be an object.
-                if not isinstance(parsed, dict):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                expected_keys = {
-                    "id",
-                    "entity",
-                    "eventTime",
-                    "revision",
-                    "text",
-                }
-
-                if set(parsed.keys()) != expected_keys:
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                # Strings.
-                if not isinstance(parsed["id"], str):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                if not isinstance(parsed["entity"], str):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                if not isinstance(parsed["eventTime"], str):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                if not isinstance(parsed["text"], str):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                # Revision:
-                # JSON booleans are not accepted as integers.
-                revision = parsed["revision"]
-
-                if (
-                    not isinstance(revision, int)
-                    or isinstance(revision, bool)
-                    or revision < 0
-                    or revision > SAFE_INT_MAX
-                ):
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                # Timestamp
-                event_time = norm_ts(parsed["eventTime"])
-
-                if event_time is None:
-                    codes.append("SCHEMA_INVALID")
-                    rows = []
-                    break
-
-                rows.append(
-                    {
-                        "id": parsed["id"],
-                        "entity": canon(parsed["entity"]),
-                        "eventTime": event_time,
-                        "revision": revision,
-                        "text": canon(parsed["text"]),
-                    }
-                )
-
-            # Empty/blank-only content.
-            if (
-                not rows
-                and "JSONL_INVALID" not in codes
-            ):
-                codes.append("SCHEMA_INVALID")
-
-        # Object rejected.
-        if codes:
-            rejected_objects.append(
-                {
-                    "uri": uri if isinstance(uri, str) else None,
-                    "reasonCodes": reason_codes(codes),
-                }
+            violations.append(
+                "MODEL_ARTIFACT_MISMATCH"
             )
-            continue
 
-        # Valid object contributes lineage and rows.
-        lineage.append(
-            {
-                "uri": uri,
-                "generation": generation,
-                "crc32c": crc,
-                "schemaId": "training-v1",
-            }
-        )
+        if (
+            evaluation_digest is not None
+            and isinstance(
+                expected_evaluation_digest,
+                str,
+            )
+            and expected_evaluation_digest
+            != evaluation_digest
+        ):
+            violations.append(
+                "EVALUATION_DIGEST_MISMATCH"
+            )
 
-        retained.extend(rows)
+    # --------------------------------------------------------
+    # Evaluation binding
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # Deduplication
-    # -----------------------------------------------------
-
-    best = {}
-
-    for row in retained:
-
-        key = (
-            row["entity"],
-            row["eventTime"],
-            row["text"],
-        )
-
-        existing = best.get(key)
-
-        if existing is None:
-            best[key] = row
-            continue
-
-        # Higher revision wins.
-        # If tied, UTF-8-smallest ID wins.
-        new_wins = (
-            row["revision"] > existing["revision"]
-            or (
-                row["revision"] == existing["revision"]
-                and row["id"].encode("utf-8")
-                < existing["id"].encode("utf-8")
+    if (
+        evaluation is not None
+        and model_digest is not None
+    ):
+        violations.extend(
+            validate_evaluation(
+                evaluation,
+                model_digest,
+                required_slices
+                if isinstance(required_slices, list)
+                else [],
             )
         )
 
-        if new_wins:
-            rejected_rows.append(
-                {
-                    "id": existing["id"],
-                    "reasonCodes": ["DUPLICATE"],
-                }
-            )
-            best[key] = row
-        else:
-            rejected_rows.append(
-                {
-                    "id": row["id"],
-                    "reasonCodes": ["DUPLICATE"],
-                }
+    elif evaluation is not None:
+
+        # Still validate evaluation structure when the model
+        # artifact is unavailable.
+        if not isinstance(evaluation, dict):
+            violations.append(
+                "INVALID_EVALUATION"
             )
 
-    retained = list(best.values())
+    # --------------------------------------------------------
+    # Evaluation artifact digest against manifest
+    # --------------------------------------------------------
 
-    # -----------------------------------------------------
-    # Policy / time window
-    # -----------------------------------------------------
+    if (
+        isinstance(manifest, dict)
+        and evaluation_digest is not None
+    ):
 
-    if not policy_valid:
-
-        for row in retained:
-            rejected_rows.append(
-                {
-                    "id": row["id"],
-                    "reasonCodes": ["POLICY_INVALID"],
-                }
-            )
-
-        retained = []
-
-    else:
-
-        kept = []
-
-        for row in retained:
-
-            dt = parse_ts(row["eventTime"])
-
-            if min_t <= dt <= max_t:
-                kept.append(row)
-            else:
-                rejected_rows.append(
-                    {
-                        "id": row["id"],
-                        "reasonCodes": ["OUT_OF_WINDOW"],
-                    }
-                )
-
-        retained = kept
-
-    # -----------------------------------------------------
-    # Split
-    # -----------------------------------------------------
-
-    train = []
-    validation = []
-    test = []
-
-    for row in retained:
-
-        bucket = (
-            hashlib.sha256(
-                row["entity"].encode("utf-8")
-            ).digest()[0]
-            % 10
+        expected = manifest.get(
+            "evaluationArtifactDigest"
         )
 
-        if 0 <= bucket <= 5:
-            train.append(row)
+        if (
+            isinstance(expected, str)
+            and expected != evaluation_digest
+        ):
+            violations.append(
+                "EVALUATION_ARTIFACT_MISMATCH"
+            )
 
-        elif 6 <= bucket <= 7:
-            validation.append(row)
+    # --------------------------------------------------------
+    # Model card
+    # --------------------------------------------------------
 
-        else:
-            test.append(row)
+    if "README.md" in files:
 
-    # -----------------------------------------------------
-    # Contamination
-    # -----------------------------------------------------
+        readme = files["README.md"]
 
-    train_sets = [
-        words(row["text"])
-        for row in train
-    ]
+        violations.extend(
+            validate_model_card(
+                readme,
+                manifest
+                if isinstance(manifest, dict)
+                else {},
+                evaluation
+                if isinstance(evaluation, dict)
+                else {},
+                policy,
+            )
+        )
 
-    def remove_contamination(rows):
+    # --------------------------------------------------------
+    # Deterministic violations
+    # --------------------------------------------------------
 
-        kept = []
-
-        for row in rows:
-
-            current_words = words(row["text"])
-
-            contaminated = False
-
-            for train_words in train_sets:
-
-                similarity = jaccard(
-                    current_words,
-                    train_words,
-                )
-
-                if similarity >= threshold:
-                    rejected_rows.append(
-                        {
-                            "id": row["id"],
-                            "reasonCodes": [
-                                "TRAIN_CONTAMINATION"
-                            ],
-                        }
-                    )
-                    contaminated = True
-                    break
-
-            if not contaminated:
-                kept.append(row)
-
-        return kept
-
-    validation = remove_contamination(validation)
-    test = remove_contamination(test)
-
-    # -----------------------------------------------------
-    # Deterministic artifacts
-    # -----------------------------------------------------
-
-    train_digest, train = digest(train)
-    validation_digest, validation = digest(validation)
-    test_digest, test = digest(test)
-
-    # -----------------------------------------------------
-    # Final deterministic ordering
-    # -----------------------------------------------------
-
-    rejected_objects = sort_rejected_objects(
-        rejected_objects
+    violations = sorted(
+        set(violations),
+        key=lambda x: x.encode("utf-8"),
     )
 
-    rejected_rows = sort_rejected_rows(
-        rejected_rows
+    # --------------------------------------------------------
+    # Decision
+    # --------------------------------------------------------
+
+    decision = (
+        "admit"
+        if len(violations) == 0
+        else "reject"
     )
-
-    lineage = sort_lineage(lineage)
-
-    # -----------------------------------------------------
-    # Exact response shape
-    # -----------------------------------------------------
 
     return {
-        "splits": {
-            "train": train,
-            "validation": validation,
-            "test": test,
-        },
-        "rejectedObjects": rejected_objects,
-        "rejectedRows": rejected_rows,
-        "digests": {
-            "train": train_digest,
-            "validation": validation_digest,
-            "test": test_digest,
-        },
-        "lineage": lineage,
+        "decision": decision,
+        "violations": violations,
+        "inventoryDigest": inventory_digest,
     }
